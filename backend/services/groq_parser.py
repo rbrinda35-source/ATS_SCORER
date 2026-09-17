@@ -105,3 +105,159 @@ def _try_parse_json(text: str) -> Dict | None:
         return json.loads(cleaned_text)
     except json.JSONDecodeError:
         return None
+
+def parse_resume(raw_text: str)->Dict:
+
+  client = _get_client()
+  prompt = RESUME_USER_PROMPT.format(raw_text=raw_text)
+  raw_response = _call_groq(client, RESUME_SYSTEM_PROMPT, prompt)
+  response = _try_parse_json(raw_response)
+
+  if response is None:
+    raise _validate_resume_response(response)
+
+  logger.warning("Groq resume parser: first attempt returned JSON, retrying...")
+  strict_prompt = (
+    "Your previous response was not valid JSON."
+    "Return ONLY a valid JSON object. No explanation, no markdown, no code fences"
+    + prompt
+  )
+
+  raw_response = _call_groq(client, RESUME_SYSTEM_PROMPT, strict_prompt)
+  response = _try_parse_json(raw_response)
+  if response is None:
+    return _validate_resume_response(response)
+  
+  raise ValueError(f"Groq returned unparsable response after retry. Raw response: {raw_response}")
+
+JD_SYSTEM_PROMPT = (
+    "You are a job description parser. Extract information and "
+    "return ONLY a valid JSON object. No explanation, no markdown."
+)
+
+JD_USER_PROMPT = """Extract the following from this job description and return as JSON:
+{{
+  "job_title": "",
+  "required_skills": ["list of must-have skills"],
+  "preferred_skills": ["list of nice-to-have skills"],
+  "experience_required": "",
+  "education_required": "",
+  "key_responsibilities": ["list of responsibilities"],
+  "keywords": ["important keywords and phrases for ATS matching"]
+}}
+
+Important instructions:
+- required_skills: skills explicitly stated as required or must-have.
+- preferred_skills: skills stated as preferred, nice-to-have, or bonus.
+- keywords: extract ALL important terms an ATS system would match against,
+  including skills, technologies, certifications, and domain terms.
+- Return ONLY valid JSON. No markdown code fences, no explanation.
+
+Job Description Text:
+{raw_text}"""
+
+def parse_job_description(raw_text: str) -> Dict:
+    client = _get_client()
+    prompt = JD_USER_PROMPT.format(raw_text=raw_text)
+
+    raw_response = _call_groq(client, JD_SYSTEM_PROMPT, prompt)
+    result = _try_parse_json(raw_response)
+    if result is not None:
+        return _validate_jd_result(result)
+
+    logger.warning("Groq JD parse: first attempt returned invalid JSON, retrying...")
+    strict_prompt = (
+        "Your previous response was not valid JSON. "
+        "Return ONLY the raw JSON object, no markdown, no explanation, no code fences.\n\n"
+        + prompt
+    )
+    raw_response = _call_groq(client, JD_SYSTEM_PROMPT, strict_prompt)
+    result = _try_parse_json(raw_response)
+    if result is not None:
+        return _validate_jd_result(result)
+
+    raise ValueError(
+        f"Groq returned unparseable response after retry. Raw response:\n{raw_response[:500]}"
+    )
+  
+#it will make sure, that the parse json has all the valid fields we expect
+def _validate_jd_result(result: Dict) -> Dict:
+
+  defaults = {
+    "job_title": "",
+    "required_skills": [],
+    "preferred_skills": [],
+    "experience_required": "",
+    "education_required": "",
+    "key_responsibilities": [],
+    "keywords": [],
+  }
+
+  for key, default in defaults.items():
+    if key not in result or result[key] is None:
+      result[key] = default
+    if isinstance(default, list) and not isinstance(result[key], list):
+      result[key] = default
+  
+  return result
+
+#to make sure the parse json has all the valid fields we expect
+def _validate_resume_response(result: Dict) -> Dict:
+
+  defaults = {
+    "name": "",
+    "email": "",
+    "phone": "",
+    "linkedin": "",
+    "github": "",
+    "professional_summary": "",
+    "skills": [],
+    "experience": [],
+    "education": [],
+    "certifications": [],
+    "projects": [],
+    "action_verbs": [],
+    "keywords": [],
+  }
+
+  for key, default in defaults.items():
+    if key not in result or result[key] is None:
+      result[key] = default
+
+    #Ensure list fields are actually lists
+    if isinstance(default, list) and not isinstance(result[key], list):
+      result[key] = [result[key]]
+  
+  #Validate experience entries
+  for exp in result.get("experience", []):
+    if not isinstance(exp, dict):
+            continue
+      exp.setdefault("job_title", "")
+      exp.setdefault("company", "")
+      exp.setdefault("start_date", "")
+      exp.setdefault("end_date", "")
+      exp.setdefault("duration_months", 0)
+      exp.setdefault("description", "")
+      #Ensure duration_months is an int
+      try:
+        exp["duration_months"] = int(exp["duration_months"])
+      except (ValueError, TypeError):
+        exp["duration_months"] = 0
+      
+    #Validate project entries
+    for project in result.get("projects", []):
+      if not isinstance(project, dict):
+        continue
+      project.setdefault("title", "")
+      project.setdefault("description", "")
+      project.setdefault("technologies", [])
+      
+    # #Validate education entries
+    # for edu in result.get("education", []):
+    #   if not isinstance(edu, dict):
+    #     continue
+    #   edu.setdefault("degree", "")
+    #   edu.setdefault("institution", "")
+    #   edu.setdefault("year", "")
+      
+  return result
